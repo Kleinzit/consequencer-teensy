@@ -1,83 +1,119 @@
 #include "rs485.h"
-#include <Arduino.h>
+#include "config.h"
+
+// Pin definitions
+#define RS485_SERIAL Serial7
+#define RS485_DIR_PIN 30
+
+// Protocol constants
+#define REQUEST_HEADER_1 0xD1
+#define REQUEST_HEADER_2 0xCC
+#define ACK_BYTE_1 0xA5
+#define ACK_BYTE_2 0x55
+#define TIMEOUT_MS 25
 
 void RS485::init() {
-    RS485_SERIAL.begin(RS485_BAUD);
+    // Initialize DIP switch pins for address reading
+    pinMode(DIP0_PIN, INPUT_PULLUP);
+    pinMode(DIP1_PIN, INPUT_PULLUP);
+    
+    // Initialize direction control pin
+    pinMode(RS485_DIR_PIN, OUTPUT);
+    digitalWrite(RS485_DIR_PIN, LOW);  // Start in receive mode
+    
+    // Initialize serial
+    RS485_SERIAL.begin(115200);
+    
     // Clear any existing data in the buffer
     while (RS485_SERIAL.available()) {
         RS485_SERIAL.read();
     }
 }
 
-#ifdef MASTER_MODE
-bool RS485::pollSlave(bool keyState[ROWS][COLS]) {
-    // Send poll request
-    RS485_SERIAL.write(POLL_REQUEST);
+uint8_t RS485::getAddress() {
+    // Read address from DIP switches (0-3)
+    // DIP switches are active LOW (pulled up by default)
+    uint8_t bit0 = (digitalRead(DIP0_PIN) == LOW) ? 1 : 0;
+    uint8_t bit1 = (digitalRead(DIP1_PIN) == LOW) ? 1 : 0;
+    return (bit1 << 1) | bit0;
+}
+
+bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step) {
+    // Clear any stale data in receive buffer
+    while (RS485_SERIAL.available()) {
+        RS485_SERIAL.read();
+    }
+    
+    // Set to transmit mode
+    digitalWrite(RS485_DIR_PIN, HIGH);
+    delayMicroseconds(10);  // Wait for driver to enable (MAX3485 requires 300ns)
+    
+    // Send 4-byte request: [0xD1, 0xCC, address, step]
+    RS485_SERIAL.write(REQUEST_HEADER_1);
+    RS485_SERIAL.write(REQUEST_HEADER_2);
+    RS485_SERIAL.write(slaveAddress);
+    RS485_SERIAL.write(step);
     RS485_SERIAL.flush();
     
-    // Wait for response with timeout
-    return receiveKeyState(keyState);
-}
-#endif
-
-#ifdef SLAVE_MODE
-void RS485::checkAndRespond(bool keyState[ROWS][COLS]) {
-    // Check if there's a poll request
-    if (RS485_SERIAL.available() > 0) {
-        uint8_t received = RS485_SERIAL.read();
-        
-        if (received == POLL_REQUEST) {
-            // Send current key state
-            sendKeyState(keyState);
-        }
-    }
-}
-#endif
-
-void RS485::sendKeyState(bool keyState[ROWS][COLS]) {
-    uint8_t data[ROWS];
+    delayMicroseconds(10);
+    // Switch back to receive mode
+    digitalWrite(RS485_DIR_PIN, LOW);
+   
+    // Wait for 2-byte ACK response: [0xA5, 0x55]
+    unsigned long startTime = millis();
+    uint8_t bytesReceived = 0;
+    uint8_t response[2] = {0, 0};
     
-    // Pack the 2D boolean array into bytes
-    // Each byte represents one row, with each bit representing a column
-    for (int row = 0; row < ROWS; row++) {
-        data[row] = 0;
-        for (int col = 0; col < COLS; col++) {
-            if (keyState[row][col]) {
-                data[row] |= (1 << col);
+    while ((millis() - startTime) < TIMEOUT_MS) {
+        if (RS485_SERIAL.available() > 0) {
+            response[bytesReceived] = RS485_SERIAL.read();
+            bytesReceived++;
+            
+            if (bytesReceived == 2) {
+                // Check if response matches ACK pattern
+                if (response[0] == ACK_BYTE_1 && response[1] == ACK_BYTE_2) {
+                    return true;
+                }
+                return false;  // Wrong response
             }
         }
     }
     
-    // Send the packed data
-    RS485_SERIAL.write(data, ROWS);
-    RS485_SERIAL.flush();
+    return false;  // Timeout
 }
 
-bool RS485::receiveKeyState(bool keyState[ROWS][COLS]) {
-    unsigned long startTime = millis();
-    int bytesReceived = 0;
-    uint8_t data[ROWS];
-    
-    // Wait for all bytes with timeout
-    while (bytesReceived < ROWS && (millis() - startTime) < TIMEOUT_MS) {
-        if (RS485_SERIAL.available() > 0) {
-            data[bytesReceived] = RS485_SERIAL.read();
-            bytesReceived++;
-        }
-    }
-    
-    // Check if we received all bytes
-    if (bytesReceived != ROWS) {
-        return false;
-    }
-    
-    // Unpack the bytes into the 2D boolean array
-    for (int row = 0; row < ROWS; row++) {
-        for (int col = 0; col < COLS; col++) {
-            keyState[row][col] = (data[row] & (1 << col)) != 0;
-        }
-    }
-    
-    return true;
-}
+void RS485::listenAndRespond(uint8_t myAddress) {
+    // Check if we have at least 4 bytes available for a complete request
+    if (RS485_SERIAL.available() >= 4) {
+        uint8_t byte1 = RS485_SERIAL.read();
+        
+        // Check if this could be the start of a request
+        if (byte1 == REQUEST_HEADER_1) {
+            uint8_t byte2 = RS485_SERIAL.read();
+            uint8_t byte3 = RS485_SERIAL.read();
+            uint8_t byte4 = RS485_SERIAL.read();
+            
+            // Check if request header is valid
+            if (byte2 == REQUEST_HEADER_2) {
+                // Store the step data (all slaves read this, regardless of address)
+                lastReceivedStep = byte4;
+                
+                // Check if request is addressed to us
+                if (byte3 == myAddress) {
+                    // Valid request for this slave - send ACK
+                    digitalWrite(RS485_DIR_PIN, HIGH);
+                    delayMicroseconds(10);  // Wait for driver to enable
+                    
+                    RS485_SERIAL.write(ACK_BYTE_1);
+                    RS485_SERIAL.write(ACK_BYTE_2);
+                    RS485_SERIAL.flush();
 
+                    delayMicroseconds(10);
+                    digitalWrite(RS485_DIR_PIN, LOW);
+                    
+                    Serial.println("ACK sent to master");
+                }
+            }
+        }
+    }
+}

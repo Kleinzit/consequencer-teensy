@@ -1,5 +1,3 @@
-#ifdef MASTER_MODE
-
 #include "sequencer.h"
 #include "midi.h"
 #include <Arduino.h>
@@ -24,7 +22,6 @@ void Sequencer::update() {
         currentStep = (currentStep + 1) % COLS;
         playStep();
         lastStepTime = currentTime;
-        digitalWrite(LED_PIN, currentStep == 0 ? HIGH : LOW);
     }
 }
 
@@ -51,5 +48,3 @@ void Sequencer::stopAllNotes() {
         }
     }
 }
-
-#endif // MASTER_MODE

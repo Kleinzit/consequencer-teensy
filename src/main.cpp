@@ -1,182 +1,208 @@
 #include <Arduino.h>
-#include "config.h"
 #include "rs485.h"
-
-#ifdef MASTER_MODE
-// Master mode: sequencer, display, MIDI, RS-485
-#include "sequencer.h"
-#include "display.h"
 #include "leds.h"
+#include "shift_register.h"
+#include "matrix.h"
+#include "config.h"
 
-Sequencer sequencer;
-Display display;
-LEDs leds;
+// Pin definitions
+#define DIP2_PIN 12  // LOW = Master, HIGH = Slave
+
+// Global objects
 RS485 rs485;
+LEDs leds;
+ShiftRegister shiftReg;
+Matrix matrix;
+bool isMaster = false;
+uint8_t myAddress = 0;
+uint8_t slaveAddresses[3] = {0, 0, 0};  // Addresses of the 3 slaves
+uint8_t currentSlaveIndex = 0;  // Round-robin index
+uint8_t slaveStatus[4] = {0, 0, 0, 0};  // Status of each address (0=off, 1=on)
+unsigned long lastPollTime = 0;
 
-void handleKeyPress(int row, int col);
-void updateDisplay();
+const unsigned long POLL_INTERVAL = 50; 
 
-void setup() {
-    pinMode(LED_PIN, OUTPUT);
-    Serial.begin(115200);
-    delay(1000); // Wait for serial connection
+// LED pattern state (32 bits for 8x4 matrix)
+uint32_t ledPattern = 0x00000000;
+
+// Basic sequencer state (4 steps)
+int currentStep = 0;
+unsigned long lastStepTime = 0;
+const unsigned long stepDuration = 250;  // 120 BPM
+
+// Matrix callbacks
+void onMatrixKeyPress(int row, int col) {
+    Serial.print("Key pressed: Row ");
+    Serial.print(row);
+    Serial.print(", Col ");
+    Serial.println(col);
     
-    Serial.println("=== MASTER MODE ===");
-    Serial.println("Initializing sequencer...");
-    sequencer.init();
+    // Calculate LED bit index (column-major order: col * ROWS + row)
+    int ledIndex = col * ROWS + row;
     
-    Serial.println("Initializing display...");
-    display.init();
+    // Toggle the corresponding LED bit
+    ledPattern ^= (1UL << ledIndex);
     
-    Serial.println("Initializing LEDs...");
-    leds.init();
+    // Write new pattern to shift register
+    shiftReg.write(ledPattern);
     
-    Serial.println("Initializing RS-485...");
-    rs485.init();
-    
-    updateDisplay();
-    Serial.println("Master ready. Starting to poll slave...");
+    Serial.print("LED Index: ");
+    Serial.print(ledIndex);
+    Serial.print(", New Pattern: 0x");
+    Serial.println(ledPattern, HEX);
 }
 
-void loop() {
-    static bool remoteKeyState[ROWS][COLS] = {false};
-    static bool lastRemoteKeyState[ROWS][COLS] = {false};
-    static unsigned long lastHeartbeat = 0;
-    static unsigned long pollCount = 0;
-    static unsigned long pollFailCount = 0;
+void onMatrixKeyRelease(int row, int col) {
+    Serial.print("Key released: Row ");
+    Serial.print(row);
+    Serial.print(", Col ");
+    Serial.println(col);
+}
+
+void setup() {
+    // Initialize USB Serial for debugging
+    Serial.begin(115200);
+    delay(1000);
     
-    // Poll slave for keyboard state
-    if (rs485.pollSlave(remoteKeyState)) {
-        pollCount++;
-        
-        // Check for key changes
-        for (int row = 0; row < ROWS; row++) {
-            for (int col = 0; col < COLS; col++) {
-                // Detect key press (was off, now on)
-                if (remoteKeyState[row][col] && !lastRemoteKeyState[row][col]) {
-                    handleKeyPress(row, col);
-                }
-                lastRemoteKeyState[row][col] = remoteKeyState[row][col];
+    // Initialize RS485 (reads DIP switches)
+    rs485.init();
+    
+    // Get this card's address from DIP switches
+    myAddress = rs485.getAddress();
+    
+    // Read DIP switch to determine master/slave mode
+    pinMode(DIP2_PIN, INPUT_PULLUP);
+    delay(10);
+    isMaster = (digitalRead(DIP2_PIN) == LOW);
+    
+    // Print mode and address
+    Serial.print("=== ");
+    if (isMaster) {
+        Serial.print("MASTER");
+    } else {
+        Serial.print("SLAVE");
+    }
+    Serial.print(" MODE === Address: ");
+    Serial.println(myAddress);
+    
+    // If master, determine which addresses are slaves (all except ours)
+    if (isMaster) {
+        uint8_t slaveIndex = 0;
+        for (uint8_t addr = 0; addr < 4; addr++) {
+            if (addr != myAddress) {
+                slaveAddresses[slaveIndex] = addr;
+                slaveIndex++;
             }
         }
-    } else {
-        pollFailCount++;
+        Serial.print("Slave addresses: ");
+        Serial.print(slaveAddresses[0]);
+        Serial.print(", ");
+        Serial.print(slaveAddresses[1]);
+        Serial.print(", ");
+        Serial.println(slaveAddresses[2]);
+        
+        // Master's own LED is always on
+        slaveStatus[myAddress] = 1;
     }
     
-    sequencer.update();
-    updateDisplay();
+    // Initialize RGB LED strips
+    leds.init();
     
-    // Heartbeat and stats every 5 seconds
-    if (millis() - lastHeartbeat > 5000) {
-        Serial.print("Heartbeat: Master running | Polls: ");
-        Serial.print(pollCount);
-        Serial.print(" | Fails: ");
-        Serial.print(pollFailCount);
-        Serial.print(" | Success rate: ");
-        if (pollCount + pollFailCount > 0) {
-            Serial.print((pollCount * 100) / (pollCount + pollFailCount));
-            Serial.println("%");
-        } else {
-            Serial.println("N/A");
-        }
-        lastHeartbeat = millis();
-    }
+    // Initialize test LEDs
+    leds.initTestLEDs();
     
-    delay(1);
-}
-
-void handleKeyPress(int row, int col) {
-    Serial.print("Remote key PRESS: [");
-    Serial.print(row);
-    Serial.print("][");
-    Serial.print(col);
-    Serial.println("] - Toggling step");
+    // Initialize shift register
+    shiftReg.init();
+    Serial.println("Shift register initialized");
     
-    sequencer.toggleStep(row, col);
-    updateDisplay();
-}
-
-void updateDisplay() {
-    static bool grid[ROWS][COLS];
-    
-    for (int row = 0; row < ROWS; row++) {
-        for (int col = 0; col < COLS; col++) {
-            grid[row][col] = sequencer.isStepActive(row, col);
-        }
-    }
-    
-    int currentStep = sequencer.getCurrentStep();
-    leds.update(grid, currentStep);
-    display.updateGrid(grid, currentStep);
-}
-
-#endif // MASTER_MODE
-
-#ifdef SLAVE_MODE
-// Slave mode: matrix scanning, RS-485 only
-#include "matrix.h"
-
-Matrix matrix;
-RS485 rs485;
-
-void handleKeyPress(int row, int col);
-void handleKeyRelease(int row, int col);
-
-void setup() {
-    pinMode(LED_PIN, OUTPUT);
-    Serial.begin(115200);
-    delay(1000); // Wait for serial connection
-    
-    Serial.println("=== SLAVE MODE ===");
-    Serial.println("Initializing keyboard matrix...");
+    // Initialize matrix with callbacks
     matrix.init();
-    matrix.setKeyPressCallback(handleKeyPress);
-    matrix.setKeyReleaseCallback(handleKeyRelease);
+    matrix.setKeyPressCallback(onMatrixKeyPress);
+    matrix.setKeyReleaseCallback(onMatrixKeyRelease);
+    Serial.println("Matrix initialized");
     
-    Serial.println("Initializing RS-485...");
-    rs485.init();
+    // Run through test leds to indicate mode
+    for (int j = 0; j < (isMaster ? 1 : 2); j++) {
+        leds.updateTestLEDs(0x01);  // LED 0
+        delay(100);
+        leds.updateTestLEDs(0x02);  // LED 1
+        delay(100);
+        leds.updateTestLEDs(0x04);  // LED 2
+        delay(100);
+        leds.updateTestLEDs(0x08);  // LED 3
+        delay(100);
+        leds.updateTestLEDs(0x00);  // All off
+        delay(100);
+    }
     
-    Serial.println("Slave ready. Waiting for poll requests...");
+    Serial.println("Ready!");
 }
 
 void loop() {
-    static bool keyState[ROWS][COLS];
-    static unsigned long lastHeartbeat = 0;
+    unsigned long currentTime = millis();
     
-    // Scan the keyboard matrix
-    matrix.scan();
-    
-    // Get current key state
-    matrix.getKeyState(keyState);
-    
-    // Check for RS-485 poll requests and respond
-    rs485.checkAndRespond(keyState);
-    
-    // Heartbeat every 5 seconds
-    if (millis() - lastHeartbeat > 5000) {
-        Serial.println("Heartbeat: Slave running...");
-        lastHeartbeat = millis();
+    // Update sequencer step (only master increments)
+    if (isMaster && currentTime - lastStepTime >= stepDuration) {
+        currentStep = (currentStep + 1) % 16;  // Cycle through 0-15
+        lastStepTime += stepDuration;  // Use scheduled time, not actual time
     }
     
-    delay(1);
+    // Slaves get step from RS485
+    if (!isMaster) {
+        currentStep = rs485.getLastReceivedStep();
+    }
+    
+    // Calculate local column to highlight (0-3) based on global step (0-15) and address
+    // Each board handles 4 steps: board 0 = steps 0-3, board 1 = steps 4-7, etc.
+    int localCol = -1;  // -1 means don't highlight
+    int boardStartStep = myAddress * 4;
+    int boardEndStep = boardStartStep + 3;
+    if (currentStep >= boardStartStep && currentStep <= boardEndStep) {
+        localCol = currentStep % 4;
+    }
+    
+    // Run rainbow animation on LED strips with current step highlighting
+    leds.runRainbowAnimation(localCol);
+    
+    // Scan matrix for key presses
+    matrix.scan();
+   
+    if (isMaster) {
+        // MASTER MODE: Round-robin polling
+        if (currentTime - lastPollTime > POLL_INTERVAL) {
+            lastPollTime = currentTime;  // Update poll time
+            
+            // Get the current slave address to poll
+            uint8_t slaveAddr = slaveAddresses[currentSlaveIndex];
+            
+            Serial.print("Polling slave ");
+            Serial.print(slaveAddr);
+            Serial.print("... ");
+            
+            // Send request with current step and wait for response
+            if (rs485.sendRequestToSlave(slaveAddr, currentStep)) {
+                slaveStatus[slaveAddr] = 1;  // Mark as responding
+                Serial.println("OK!");
+            } else {
+                slaveStatus[slaveAddr] = 0;  // Mark as not responding
+                Serial.println("TIMEOUT");
+            }
+            
+            // Update LED display to show current status
+            uint8_t ledMask = 0;
+            for (int i = 0; i < 4; i++) {
+                if (slaveStatus[i]) {
+                    ledMask |= (1 << i);
+                }
+            }
+            leds.updateTestLEDs(ledMask);
+            
+            // Move to next slave (round-robin)
+            currentSlaveIndex = (currentSlaveIndex + 1) % 3;
+        }
+    } else {
+        // SLAVE MODE: Listen and respond
+        rs485.listenAndRespond(myAddress);
+        delay(1);
+    }
 }
-
-void handleKeyPress(int row, int col) {
-    Serial.print("Key PRESS: [");
-    Serial.print(row);
-    Serial.print("][");
-    Serial.print(col);
-    Serial.println("]");
-    digitalWrite(LED_PIN, HIGH);
-}
-
-void handleKeyRelease(int row, int col) {
-    Serial.print("Key RELEASE: [");
-    Serial.print(row);
-    Serial.print("][");
-    Serial.print(col);
-    Serial.println("]");
-    digitalWrite(LED_PIN, LOW);
-}
-
-#endif // SLAVE_MODE
