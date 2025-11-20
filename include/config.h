@@ -20,11 +20,15 @@
 #define DIP1_PIN 11  // Address bit 1 (MSB)
 #define DIP2_PIN 12  // LOW = Master, HIGH = Slave
 
+// Start/Stop button
+#define START_STOP_BUTTON_PIN 25  // Pull-up: LOW = pressed, HIGH = released
+
 // WS2812B RGB LED strips (3 strips, up to 32 LEDs each)
 #define LED_STRIP_1_PIN 16
 #define LED_STRIP_2_PIN 41
 #define LED_STRIP_3_PIN 39
 #define NUM_LEDS_PER_STRIP 32
+#define NUM_LEDS_STRIP_1 50  // Strip 1 idle animation uses 50 LEDs
 
 // Shift Register for output LEDs
 #define SHIFT_REG_SCLK 27  // Serial Clock
@@ -52,7 +56,8 @@ extern const int rowPins[ROWS];
 extern const int colPins[COLS];
 
 // Sequencer configuration
-extern const int sequencerNotes[ROWS];
+extern const int sequencerNotes[3][ROWS];
 extern const char* noteNames[ROWS];
 extern const unsigned long stepDuration;
 extern const unsigned long debounceDelay;
+extern const unsigned long POLL_INTERVAL;

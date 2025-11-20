@@ -38,7 +38,7 @@ uint8_t RS485::getAddress() {
     return (bit1 << 1) | bit0;
 }
 
-bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step, uint32_t& buttonState) {
+bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step, uint16_t idleStep, uint32_t& buttonState) {
     // Clear any stale data in receive buffer
     while (RS485_SERIAL.available()) {
         RS485_SERIAL.read();
@@ -48,11 +48,13 @@ bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step, uint32_t& but
     digitalWrite(RS485_DIR_PIN, HIGH);
     delayMicroseconds(10);  // Wait for driver to enable (MAX3485 requires 300ns)
     
-    // Send 4-byte request: [0xD1, 0xCC, address, step]
+    // Send 6-byte request: [0xD1, 0xCC, address, step, idleStep_low, idleStep_high]
     RS485_SERIAL.write(REQUEST_HEADER_1);
     RS485_SERIAL.write(REQUEST_HEADER_2);
     RS485_SERIAL.write(slaveAddress);
     RS485_SERIAL.write(step);
+    RS485_SERIAL.write((uint8_t)(idleStep & 0xFF));         // Low byte
+    RS485_SERIAL.write((uint8_t)((idleStep >> 8) & 0xFF));  // High byte
     RS485_SERIAL.flush();
     
     delayMicroseconds(10);
@@ -88,8 +90,8 @@ bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step, uint32_t& but
 }
 
 void RS485::listenAndRespond(uint8_t myAddress, uint32_t buttonState) {
-    // Check if we have at least 4 bytes available for a complete request
-    if (RS485_SERIAL.available() >= 4) {
+    // Check if we have at least 6 bytes available for a complete request
+    if (RS485_SERIAL.available() >= 6) {
         uint8_t byte1 = RS485_SERIAL.read();
         
         // Check if this could be the start of a request
@@ -97,11 +99,16 @@ void RS485::listenAndRespond(uint8_t myAddress, uint32_t buttonState) {
             uint8_t byte2 = RS485_SERIAL.read();
             uint8_t byte3 = RS485_SERIAL.read();
             uint8_t byte4 = RS485_SERIAL.read();
+            uint8_t byte5 = RS485_SERIAL.read();
+            uint8_t byte6 = RS485_SERIAL.read();
             
             // Check if request header is valid
             if (byte2 == REQUEST_HEADER_2) {
                 // Store the step data (all slaves read this, regardless of address)
                 lastReceivedStep = byte4;
+                
+                // Store the idle step data (all slaves read this, regardless of address)
+                lastReceivedIdleStep = ((uint16_t)byte5) | (((uint16_t)byte6) << 8);
                 
                 // Check if request is addressed to us
                 if (byte3 == myAddress) {

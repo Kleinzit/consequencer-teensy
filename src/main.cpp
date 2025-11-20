@@ -6,9 +6,6 @@
 #include "midi.h"
 #include "config.h"
 
-// Pin definitions
-#define DIP2_PIN 12  // LOW = Master, HIGH = Slave
-
 // Global objects
 RS485 rs485;
 LEDs leds;
@@ -21,26 +18,32 @@ uint8_t currentSlaveIndex = 0;  // Round-robin index
 uint8_t slaveStatus[4] = {0, 0, 0, 0};  // Status of each address (0=off, 1=on)
 unsigned long lastPollTime = 0;
 
-const unsigned long POLL_INTERVAL = 50; 
-
 // LED pattern state (32 bits for 8x4 matrix)
 uint32_t ledPattern = 0x00000000;
 
 // Button state for all 4 boards (master tracks all)
 uint32_t allBoardStates[4] = {0, 0, 0, 0};
 
+uint32_t previousBoardStates[4] = {0, 0, 0, 0};
+
+unsigned long lastBoardStateChangeTime = 0;
+
 // Basic sequencer state (4 steps)
 int currentStep = 0;
 unsigned long lastStepTime = 0;
-const unsigned long stepDuration = 125;  // 120 BPM
+
+// Idle animation state
+uint16_t idleAnimationStep = 0;
+unsigned long lastIdleStepTime = 0;
+
+// Start/Stop button state
+bool isRunning = true;
+bool lastButtonState = HIGH;
+unsigned long lastButtonPressTime = 0;
+int currentNoteSet = 0;
 
 // Matrix callbacks
 void onMatrixKeyPress(int row, int col) {
-    Serial.print("Key pressed: Row ");
-    Serial.print(row);
-    Serial.print(", Col ");
-    Serial.println(col);
-    
     // Calculate LED bit index (column-major order: col * ROWS + row)
     int ledIndex = col * ROWS + row;
     
@@ -49,18 +52,6 @@ void onMatrixKeyPress(int row, int col) {
     
     // Write new pattern to shift register
     shiftReg.write(ledPattern);
-    
-    Serial.print("LED Index: ");
-    Serial.print(ledIndex);
-    Serial.print(", New Pattern: 0x");
-    Serial.println(ledPattern, HEX);
-}
-
-void onMatrixKeyRelease(int row, int col) {
-    Serial.print("Key released: Row ");
-    Serial.print(row);
-    Serial.print(", Col ");
-    Serial.println(col);
 }
 
 // Display function for button state output
@@ -125,6 +116,9 @@ void setup() {
     delay(10);
     isMaster = (digitalRead(DIP2_PIN) == LOW);
     
+    // Initialize start/stop button
+    pinMode(START_STOP_BUTTON_PIN, INPUT_PULLUP);
+    
     // Print mode and address
     Serial.print("=== ");
     if (isMaster) {
@@ -168,7 +162,6 @@ void setup() {
     // Initialize matrix with callbacks
     matrix.init();
     matrix.setKeyPressCallback(onMatrixKeyPress);
-    matrix.setKeyReleaseCallback(onMatrixKeyRelease);
     Serial.println("Matrix initialized");
     
     // Run through test leds to indicate mode
@@ -188,10 +181,63 @@ void setup() {
     Serial.println("Ready!");
 }
 
-void loop() {
+void resetSequencer() {
+    // Stop all currently playing MIDI notes
+    for (int row = 0; row < ROWS; row++) {
+        MIDI::stopNote(sequencerNotes[1][row]);
+        MIDI::stopNote(sequencerNotes[2][row]);
+        MIDI::stopNote(sequencerNotes[0][row]);
+    }
+    
+    // Reset step to 0
+    currentStep = 0;
+    
+    // Clear LED strips
+    leds.clear();
+    
+    // Set all matrix LEDs on when stopped
+    ledPattern = 0xFFFFFFFF;
+    shiftReg.write(ledPattern);
+}
+
+void checkStartStopButton() {
+    bool currentButtonState = digitalRead(START_STOP_BUTTON_PIN);
     unsigned long currentTime = millis();
     
-    if (isMaster && currentTime - lastStepTime >= stepDuration) {
+    // Check for button press (HIGH to LOW transition) with debouncing
+    if (currentButtonState == LOW && lastButtonState == HIGH) {
+        // Check if enough time has passed since last press (debounce)
+        if (currentTime - lastButtonPressTime > debounceDelay) {
+            // Toggle running state
+            isRunning = !isRunning;
+            
+            if (isRunning) {
+                // Starting: cycle to next note set
+                currentNoteSet = (currentNoteSet + 1) % 3;
+                lastStepTime = currentTime;
+                
+                // Clear all matrix LEDs when starting
+                ledPattern = 0x00000000;
+                shiftReg.write(ledPattern);
+                leds.clear();
+            } else {
+                // Stopping: reset sequencer
+                resetSequencer();
+                leds.clear();
+            }
+            
+            lastButtonPressTime = currentTime;
+        }
+    }
+    
+    lastButtonState = currentButtonState;
+}
+
+void runSequencer() {
+    unsigned long currentTime = millis();
+    
+    // Only advance steps and play MIDI when running
+    if (isRunning && isMaster && currentTime - lastStepTime >= stepDuration) {
         currentStep = (currentStep + 1) % 16;
         lastStepTime += stepDuration;
         
@@ -200,27 +246,66 @@ void loop() {
         for (int row = 0; row < ROWS; row++) {
             int bitIndex = localCol * ROWS + row;
             if ((allBoardStates[board] >> bitIndex) & 1) {
-                MIDI::playNote(sequencerNotes[row]);
-            }
+                MIDI::playNote(sequencerNotes[currentNoteSet][row]);
+            } 
         }
     }
     
-    // Slaves get step from RS485
+    // When stopped, master sets currentStep to 255
+    if (!isRunning && isMaster) {
+        currentStep = 255;
+    }
+    
+    // Advance idle animation when stopped (master only)
+    if (!isRunning && isMaster && currentTime - lastIdleStepTime >= 50) {
+        idleAnimationStep = (idleAnimationStep + 1) % 1600;
+        lastIdleStepTime = currentTime;
+    }
+    
+    // Slaves get step and idle step from RS485
     if (!isMaster) {
+        static int lastSlaveStep = 0;
         currentStep = rs485.getLastReceivedStep();
+        idleAnimationStep = rs485.getLastReceivedIdleStep();
+        
+        // Detect stop/start transitions
+        if (currentStep == 255 && lastSlaveStep != 255) {
+            // Transition to stopped: set all LEDs on
+            ledPattern = 0xFFFFFFFF;
+            shiftReg.write(ledPattern);
+            isRunning = false;
+            leds.clear();
+        } else if (currentStep != 255 && lastSlaveStep == 255) {
+            // Transition to running: clear all LEDs
+            ledPattern = 0x00000000;
+            shiftReg.write(ledPattern);
+            isRunning = true;
+            leds.clear();
+        }
+        
+        lastSlaveStep = currentStep;
     }
     
-    // Calculate local column to highlight (0-3) based on global step (0-15) and address
-    // Each board handles 4 steps: board 0 = steps 0-3, board 1 = steps 4-7, etc.
-    int localCol = -1;  // -1 means don't highlight
-    int boardStartStep = myAddress * 4;
-    int boardEndStep = boardStartStep + 3;
-    if (currentStep >= boardStartStep && currentStep <= boardEndStep) {
-        localCol = currentStep % 4;
-    }
+    // Determine if strip3 should be enabled (disabled when step == 255, which indicates stopped)
+    bool enableStrip3 = (currentStep != 255);
     
-    // Run rainbow animation on LED strips with current step highlighting
-    leds.runRainbowAnimation(localCol);
+    if (isRunning) {
+        // When running: show rainbow animation on strip 3 with step highlighting
+        // Calculate local column to highlight (0-3) based on global step (0-15) and address
+        // Each board handles 4 steps: board 0 = steps 0-3, board 1 = steps 4-7, etc.
+        int localCol = -1;  // -1 means don't highlight
+        int boardStartStep = myAddress * 4;
+        int boardEndStep = boardStartStep + 3;
+        if (currentStep >= boardStartStep && currentStep <= boardEndStep) {
+            localCol = currentStep % 4;
+        }
+        
+        // Run rainbow animation on LED strips with current step highlighting
+        leds.runRainbowAnimation(localCol, enableStrip3);
+    } else {
+        // When stopped: show synchronized idle animation on strip 1
+        leds.runIdleAnimation(idleAnimationStep, myAddress);
+    }
     
     // Scan matrix for key presses
     matrix.scan();
@@ -228,6 +313,10 @@ void loop() {
     if (isMaster) {
         // MASTER MODE: Round-robin polling
         
+        if (ledPattern != previousBoardStates[myAddress]) {
+            previousBoardStates[myAddress] = ledPattern;
+            lastBoardStateChangeTime = currentTime;
+        }
         // Update master's own button state
         allBoardStates[myAddress] = ledPattern;
         
@@ -237,10 +326,16 @@ void loop() {
             // Get the current slave address to poll
             uint8_t slaveAddr = slaveAddresses[currentSlaveIndex];
             
-            // Send request with current step and wait for response with button state
+            // Send request with current step, idle step, and wait for response with button state
+            // When stopped, send step 255 as a special indicator
+            uint8_t stepToSend = isRunning ? currentStep : 255;
             uint32_t slaveButtonState = 0;
-            if (rs485.sendRequestToSlave(slaveAddr, currentStep, slaveButtonState)) {
+            if (rs485.sendRequestToSlave(slaveAddr, stepToSend, idleAnimationStep, slaveButtonState)) {
                 slaveStatus[slaveAddr] = 1;  // Mark as responding
+                if (slaveButtonState != previousBoardStates[slaveAddr]) {
+                    previousBoardStates[slaveAddr] = slaveButtonState;
+                    lastBoardStateChangeTime = currentTime;
+                }
                 allBoardStates[slaveAddr] = slaveButtonState;  // Save button state
             } else {
                 slaveStatus[slaveAddr] = 0;  // Mark as not responding
@@ -261,9 +356,22 @@ void loop() {
             // Display current state of all boards
             displayButtonStates();
         }
+        // if its been 32 bars since the last board state change and we are running, reset the sequencer
+        if (currentTime - lastBoardStateChangeTime > 32 * stepDuration * 16 && isRunning) {
+            resetSequencer();
+            isRunning = false;
+        }
     } else {
         // SLAVE MODE: Listen and respond with button state
         rs485.listenAndRespond(myAddress, ledPattern);
         delay(1);
     }
+   
+}
+
+void loop() {
+    if (isMaster) {
+        checkStartStopButton();
+    }
+    runSequencer();
 }
