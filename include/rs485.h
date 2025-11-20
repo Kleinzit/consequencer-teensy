@@ -5,8 +5,8 @@ class RS485 {
 public:
     void init();
     uint8_t getAddress();
-    bool sendRequestToSlave(uint8_t slaveAddress, uint8_t step);
-    void listenAndRespond(uint8_t myAddress);
+    bool sendRequestToSlave(uint8_t slaveAddress, uint8_t step, uint32_t& buttonState);
+    void listenAndRespond(uint8_t myAddress, uint32_t buttonState);
     uint8_t getLastReceivedStep() const { return lastReceivedStep; }
 
 private:

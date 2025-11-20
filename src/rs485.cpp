@@ -38,7 +38,7 @@ uint8_t RS485::getAddress() {
     return (bit1 << 1) | bit0;
 }
 
-bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step) {
+bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step, uint32_t& buttonState) {
     // Clear any stale data in receive buffer
     while (RS485_SERIAL.available()) {
         RS485_SERIAL.read();
@@ -59,19 +59,24 @@ bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step) {
     // Switch back to receive mode
     digitalWrite(RS485_DIR_PIN, LOW);
    
-    // Wait for 2-byte ACK response: [0xA5, 0x55]
+    // Wait for 6-byte response: [0xA5, 0x55, byte0, byte1, byte2, byte3]
     unsigned long startTime = millis();
     uint8_t bytesReceived = 0;
-    uint8_t response[2] = {0, 0};
+    uint8_t response[6] = {0, 0, 0, 0, 0, 0};
     
     while ((millis() - startTime) < TIMEOUT_MS) {
         if (RS485_SERIAL.available() > 0) {
             response[bytesReceived] = RS485_SERIAL.read();
             bytesReceived++;
             
-            if (bytesReceived == 2) {
+            if (bytesReceived == 6) {
                 // Check if response matches ACK pattern
                 if (response[0] == ACK_BYTE_1 && response[1] == ACK_BYTE_2) {
+                    // Extract 32-bit button state (little-endian)
+                    buttonState = ((uint32_t)response[2]) |
+                                  ((uint32_t)response[3] << 8) |
+                                  ((uint32_t)response[4] << 16) |
+                                  ((uint32_t)response[5] << 24);
                     return true;
                 }
                 return false;  // Wrong response
@@ -82,7 +87,7 @@ bool RS485::sendRequestToSlave(uint8_t slaveAddress, uint8_t step) {
     return false;  // Timeout
 }
 
-void RS485::listenAndRespond(uint8_t myAddress) {
+void RS485::listenAndRespond(uint8_t myAddress, uint32_t buttonState) {
     // Check if we have at least 4 bytes available for a complete request
     if (RS485_SERIAL.available() >= 4) {
         uint8_t byte1 = RS485_SERIAL.read();
@@ -100,18 +105,23 @@ void RS485::listenAndRespond(uint8_t myAddress) {
                 
                 // Check if request is addressed to us
                 if (byte3 == myAddress) {
-                    // Valid request for this slave - send ACK
+                    // Valid request for this slave - send ACK + button state
                     digitalWrite(RS485_DIR_PIN, HIGH);
                     delayMicroseconds(10);  // Wait for driver to enable
                     
+                    // Send 6-byte response: [ACK1, ACK2, byte0, byte1, byte2, byte3]
                     RS485_SERIAL.write(ACK_BYTE_1);
                     RS485_SERIAL.write(ACK_BYTE_2);
+                    RS485_SERIAL.write((uint8_t)(buttonState & 0xFF));
+                    RS485_SERIAL.write((uint8_t)((buttonState >> 8) & 0xFF));
+                    RS485_SERIAL.write((uint8_t)((buttonState >> 16) & 0xFF));
+                    RS485_SERIAL.write((uint8_t)((buttonState >> 24) & 0xFF));
                     RS485_SERIAL.flush();
 
                     delayMicroseconds(10);
                     digitalWrite(RS485_DIR_PIN, LOW);
                     
-                    Serial.println("ACK sent to master");
+                    Serial.println("ACK + button state sent to master");
                 }
             }
         }

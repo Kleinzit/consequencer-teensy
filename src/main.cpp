@@ -3,6 +3,7 @@
 #include "leds.h"
 #include "shift_register.h"
 #include "matrix.h"
+#include "midi.h"
 #include "config.h"
 
 // Pin definitions
@@ -25,10 +26,13 @@ const unsigned long POLL_INTERVAL = 50;
 // LED pattern state (32 bits for 8x4 matrix)
 uint32_t ledPattern = 0x00000000;
 
+// Button state for all 4 boards (master tracks all)
+uint32_t allBoardStates[4] = {0, 0, 0, 0};
+
 // Basic sequencer state (4 steps)
 int currentStep = 0;
 unsigned long lastStepTime = 0;
-const unsigned long stepDuration = 250;  // 120 BPM
+const unsigned long stepDuration = 125;  // 120 BPM
 
 // Matrix callbacks
 void onMatrixKeyPress(int row, int col) {
@@ -57,6 +61,52 @@ void onMatrixKeyRelease(int row, int col) {
     Serial.print(row);
     Serial.print(", Col ");
     Serial.println(col);
+}
+
+// Display function for button state output
+void displayButtonStates() {
+    // Line 1: Step indicator (16 steps grouped by 4 to match button grid)
+    for (int step = 0; step < 16; step++) {
+        if (step == currentStep) {
+            Serial.print('x');
+        } else {
+            Serial.print('.');
+        }
+        // Add space after every 4 steps (except the last one)
+        if ((step % 4 == 3) && (step < 15)) {
+            Serial.print(' ');
+        }
+    }
+    Serial.println();
+    
+    // Lines 2-9: Button state grid (8 rows)
+    // Each row shows all 4 boards side-by-side
+    for (int row = ROWS - 1; row >= 0; row--) {
+        Serial.print('\r');  // Return to beginning of line
+        for (int board = 0; board < 4; board++) {
+            // Get button state for this board
+            uint32_t boardState = allBoardStates[board];
+            
+            // Display 4 columns for this board
+            for (int col = 0; col < COLS; col++) {
+                // Calculate bit index (column-major: col * ROWS + row)
+                int bitIndex = col * ROWS + row;
+                bool buttonState = (boardState >> bitIndex) & 1;
+                
+                // x = OFF (bit 0), o = ON (bit 1)
+                Serial.print(buttonState ? 'o' : 'x');
+            }
+            
+            // Add space between boards (except after the last one)
+            if (board < 3) {
+                Serial.print(' ');
+            }
+        }
+        Serial.println();
+    }
+    
+    Serial.println();  // Extra blank line for readability
+    
 }
 
 void setup() {
@@ -141,10 +191,18 @@ void setup() {
 void loop() {
     unsigned long currentTime = millis();
     
-    // Update sequencer step (only master increments)
     if (isMaster && currentTime - lastStepTime >= stepDuration) {
-        currentStep = (currentStep + 1) % 16;  // Cycle through 0-15
-        lastStepTime += stepDuration;  // Use scheduled time, not actual time
+        currentStep = (currentStep + 1) % 16;
+        lastStepTime += stepDuration;
+        
+        int board = currentStep / 4;
+        int localCol = currentStep % 4;
+        for (int row = 0; row < ROWS; row++) {
+            int bitIndex = localCol * ROWS + row;
+            if ((allBoardStates[board] >> bitIndex) & 1) {
+                MIDI::playNote(sequencerNotes[row]);
+            }
+        }
     }
     
     // Slaves get step from RS485
@@ -169,23 +227,23 @@ void loop() {
    
     if (isMaster) {
         // MASTER MODE: Round-robin polling
+        
+        // Update master's own button state
+        allBoardStates[myAddress] = ledPattern;
+        
         if (currentTime - lastPollTime > POLL_INTERVAL) {
             lastPollTime = currentTime;  // Update poll time
             
             // Get the current slave address to poll
             uint8_t slaveAddr = slaveAddresses[currentSlaveIndex];
             
-            Serial.print("Polling slave ");
-            Serial.print(slaveAddr);
-            Serial.print("... ");
-            
-            // Send request with current step and wait for response
-            if (rs485.sendRequestToSlave(slaveAddr, currentStep)) {
+            // Send request with current step and wait for response with button state
+            uint32_t slaveButtonState = 0;
+            if (rs485.sendRequestToSlave(slaveAddr, currentStep, slaveButtonState)) {
                 slaveStatus[slaveAddr] = 1;  // Mark as responding
-                Serial.println("OK!");
+                allBoardStates[slaveAddr] = slaveButtonState;  // Save button state
             } else {
                 slaveStatus[slaveAddr] = 0;  // Mark as not responding
-                Serial.println("TIMEOUT");
             }
             
             // Update LED display to show current status
@@ -199,10 +257,13 @@ void loop() {
             
             // Move to next slave (round-robin)
             currentSlaveIndex = (currentSlaveIndex + 1) % 3;
+            
+            // Display current state of all boards
+            displayButtonStates();
         }
     } else {
-        // SLAVE MODE: Listen and respond
-        rs485.listenAndRespond(myAddress);
+        // SLAVE MODE: Listen and respond with button state
+        rs485.listenAndRespond(myAddress, ledPattern);
         delay(1);
     }
 }

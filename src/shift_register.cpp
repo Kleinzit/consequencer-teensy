@@ -38,7 +38,7 @@ void ShiftRegister::latch() {
 }
 
 void ShiftRegister::write(uint32_t data) {
-    clockOut(data);
+    clockOut(~data);
     latch();
 }
 
