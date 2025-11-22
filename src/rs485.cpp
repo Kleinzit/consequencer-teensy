@@ -119,10 +119,19 @@ void RS485::listenAndRespond(uint8_t myAddress, uint32_t buttonState) {
                     // Send 6-byte response: [ACK1, ACK2, byte0, byte1, byte2, byte3]
                     RS485_SERIAL.write(ACK_BYTE_1);
                     RS485_SERIAL.write(ACK_BYTE_2);
-                    RS485_SERIAL.write((uint8_t)(buttonState & 0xFF));
-                    RS485_SERIAL.write((uint8_t)((buttonState >> 8) & 0xFF));
-                    RS485_SERIAL.write((uint8_t)((buttonState >> 16) & 0xFF));
-                    RS485_SERIAL.write((uint8_t)((buttonState >> 24) & 0xFF));
+                    // If step is 255, send all 0s without changing the button state
+                    if (lastReceivedStep == 255) {
+                        RS485_SERIAL.write(0x00);
+                        RS485_SERIAL.write(0x00);
+                        RS485_SERIAL.write(0x00);
+                        RS485_SERIAL.write(0x00);
+                    } else {
+                        RS485_SERIAL.write((uint8_t)(buttonState & 0xFF));
+                        RS485_SERIAL.write((uint8_t)((buttonState >> 8) & 0xFF));
+                        RS485_SERIAL.write((uint8_t)((buttonState >> 16) & 0xFF));
+                        RS485_SERIAL.write((uint8_t)((buttonState >> 24) & 0xFF));
+                    }
+
                     RS485_SERIAL.flush();
 
                     delayMicroseconds(10);
